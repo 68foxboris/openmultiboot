@@ -28,11 +28,11 @@
 #include <sys/stat.h>
 #include <mntent.h>
 #include <unistd.h>
+#include <json-c/json.h>
 
 #include "omb_common.h"
 #include "omb_log.h"
 #include "omb_utils.h"
-#include "omb_branding.h"
 
 #define OMB_FS_MAX 3
 static const char *omb_utils_fs_types[OMB_FS_MAX] = { "ext4", "ext3" };
@@ -177,48 +177,95 @@ int omb_utils_find_and_mount()
 
 omb_device_item *omb_utils_get_images()
 {
-	struct dirent *dir;
-	char datadir[255];
-	DIR *fd;
-	
+	char cmd[255];
+	int BUF_SIZE = 255;
+	char buffer[BUF_SIZE];
+	FILE *fd;
+	char *content;
+
+	struct json_object *parsed_json;
+	struct json_object *currentimage;
+	struct json_object *images_entries;
+	size_t n_images_entries;
+	struct json_object *image_entry;
+
+	struct json_object *label;
+	struct json_object *path;
+	struct json_object *identifier;
+	struct json_object *background;
+	struct json_object *kernelbin;
+	struct json_object *labelfile;
+	size_t i;
+
 	omb_device_item *first = NULL;
 	omb_device_item *last = NULL;
-	
+
+	const char* tmp;
+
 	omb_log(LOG_DEBUG, "%-33s: discover images", __FUNCTION__);
-	
-	omb_device_item *item = omb_branding_read_info("", "flash");
-	if (item != NULL) {
-		if (first == NULL)
-			first = item;
-		if (last != NULL)
-			last->next = item;
-		last = item;
+
+	sprintf(cmd, "%s/open-multiboot-menu-helper.py %s", OMB_PLUGIN_DIR, OMB_MAIN_DIR);
+	fd = popen(cmd, "r");
+	if (! fd) {
+		return first;
 	}
-
-	sprintf(datadir, "%s/%s", OMB_MAIN_DIR, OMB_DATA_DIR);
-	fd = opendir(datadir);
-	if (fd) {
-		while ((dir = readdir(fd)) != NULL) {
-			if (strlen(dir->d_name) > 0 && dir->d_name[0] != '.') {
-				char base_dir[255];
-				sprintf(base_dir, "%s/%s", datadir, dir->d_name);
-
-				if (!omb_branding_is_compatible(base_dir)) {
-					omb_log(LOG_DEBUG ,"%-33s: skipping image %s", __FUNCTION__, base_dir);
-					continue;
-				}
-
-				omb_device_item *item = omb_branding_read_info(base_dir, dir->d_name);
-				if (item != NULL) {
-					if (first == NULL)
-						first = item;
-					if (last != NULL)
-						last->next = item;
-					last = item;
-				}
-			}
+	int extent = sizeof(char) * BUF_SIZE + 1;
+	content = (char *) malloc(extent);
+	*content = '\0';
+	while (fgets(buffer, sizeof(buffer), fd) != NULL) {
+		strcat(content,buffer);
+		if ((strlen(content)+ BUF_SIZE) > extent ) {
+			extent += BUF_SIZE;
+			content = realloc( content, extent);
 		}
-		closedir(fd);
+	}
+	pclose(fd);
+
+	parsed_json = json_tokener_parse(content);
+
+	json_object_object_get_ex(parsed_json, "images_entries", &images_entries);
+
+	n_images_entries = json_object_array_length(images_entries);
+//	printf("Found %lu images_entries\n",n_images_entries);
+
+	for(i=0;i<n_images_entries;i++) {
+		image_entry = json_object_array_get_idx(images_entries, i);
+		json_object_object_get_ex(image_entry, "label", &label);
+//		printf("%lu. %s\n",i+1,json_object_get_string(label));
+		json_object_object_get_ex(image_entry, "path", &path);
+//		printf("   %s\n",json_object_get_string(path));
+		json_object_object_get_ex(image_entry, "identifier", &identifier);
+//		printf("   %s\n",json_object_get_string(identifier));
+		json_object_object_get_ex(image_entry, "background", &background);
+//		printf("   %s\n",json_object_get_string(background));
+//		json_object_object_get_ex(image_entry, "kernelbin", &kernelbin);
+//		printf("   %s\n",json_object_get_string(kernelbin));
+//		json_object_object_get_ex(image_entry, "labelfile", &labelfile);
+//		printf("   %s\n",json_object_get_string(labelfile));
+
+		omb_device_item *item = malloc(sizeof(omb_device_item));
+
+		tmp = json_object_get_string(path);
+		item->directory = malloc(strlen(tmp) + 1);
+		strcpy(item->directory,tmp);
+		tmp = json_object_get_string(identifier);
+		item->identifier = malloc(strlen(tmp) + 1);
+		strcpy(item->identifier, tmp);
+		tmp = json_object_get_string(background);
+		item->background = malloc(strlen(tmp) + 1);
+		strcpy(item->background, tmp);
+		tmp = json_object_get_string(label);
+		item->label = malloc(strlen(tmp) + 1);
+		strcpy(item->label, tmp);
+
+		item->next = NULL;
+		if (item != NULL) {
+			if (first == NULL)
+				first = item;
+			if (last != NULL)
+				last->next = item;
+			last = item;
+		}
 	}
 	return first;
 }
@@ -233,6 +280,7 @@ void omb_utils_free_items(omb_device_item *items)
 		free(tmp2->label);
 		free(tmp2->directory);
 		free(tmp2->identifier);
+		free(tmp2->background);
 		free(tmp2);
 	}
 }
@@ -240,7 +288,7 @@ void omb_utils_free_items(omb_device_item *items)
 void omb_utils_update_background(omb_device_item *item)
 {
 	char tmp[255];
-	sprintf(tmp, "%s %s/usr/share/bootlogo.mvi", OMB_SHOWIFRAME_BIN, item->directory);
+	sprintf(tmp, "%s %s%s", OMB_SHOWIFRAME_BIN, item->directory, item->background);
 	system(tmp);
 }
 
@@ -417,11 +465,13 @@ void omb_utils_prepare_destination(omb_device_item *item)
 		char sys[255];
 		char omb[255];
 		char omb_plugin[255];
+		char flash[255];
 		sprintf(dev, "%s/%s/%s/dev", OMB_MAIN_DIR, OMB_DATA_DIR, item->identifier);
 		sprintf(proc, "%s/%s/%s/proc", OMB_MAIN_DIR, OMB_DATA_DIR, item->identifier);
 		sprintf(sys, "%s/%s/%s/sys", OMB_MAIN_DIR, OMB_DATA_DIR, item->identifier);
 		sprintf(omb, "%s/%s/%s/%s", OMB_MAIN_DIR, OMB_DATA_DIR, item->identifier, OMB_MAIN_DIR);
 		sprintf(omb_plugin, "%s/%s/%s/%s", OMB_MAIN_DIR, OMB_DATA_DIR, item->identifier, OMB_PLUGIN_DIR);
+		sprintf(flash, "%s/%s/%s/%s/%s/flash", OMB_MAIN_DIR, OMB_DATA_DIR, item->identifier, OMB_MAIN_DIR, OMB_DATA_DIR);
 		
 		if (!omb_utils_is_mounted(dev))
 			if (mount("/dev", dev, NULL, MS_BIND, NULL) != 0)
@@ -448,6 +498,13 @@ void omb_utils_prepare_destination(omb_device_item *item)
 		if (!omb_utils_is_mounted(omb_plugin))
 			if (mount(OMB_PLUGIN_DIR, omb_plugin, NULL, MS_BIND, NULL) != 0)
 				omb_log(LOG_ERROR, "%-33s: cannot bind %s to %s", __FUNCTION__, OMB_PLUGIN_DIR, omb_plugin);
+
+		if (!omb_utils_dir_exists(flash))
+			mkdir(flash, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+
+		if (!omb_utils_is_mounted(flash))
+			if (mount("/", flash, NULL, MS_BIND, NULL) != 0)
+				omb_log(LOG_ERROR, "%-33s: cannot bind %s to %s", __FUNCTION__, "/", flash);
 	}
 	
 }
